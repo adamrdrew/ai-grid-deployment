@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# Bootstrap a hub from this deployment repository (install guide, page 3). It
+# uses the library at the commit the repository pins (scripts/library.sh).
+#
+# 1. Checks the deployment (check-deployment.sh), the registry logins in the
+#    auth file, and the hub's prerequisites, before it writes to the hub.
+# 2. Installs OpenShift GitOps from the library's bootstrap files.
+# 3. Applies the deployment's root/ (the root ApplicationSet and
+#    deployment-root). From then on Argo CD follows git; this script is not run
+#    again.
+# 4. Seeds the quay.io/rhoai pull secret (and the optional
+#    registry.stage.redhat.io login, when present) that the prerequisites
+#    Policy copies to every site. The credentials are read from a container
+#    auth file and never printed.
+#
+# Runs against the hub in clusters.yaml, with its login (.config/NAME/kubeconfig).
+#
+# Usage: [QUAY_AUTH_FILE=AUTH_JSON] [ALLOW_GENERIC_LOGIN=1] scripts/bootstrap-hub.sh [--deployment DIR]
+#
+# QUAY_AUTH_FILE defaults to ~/.config/containers/auth.json, else
+# $XDG_RUNTIME_DIR/containers/auth.json (as make prereqs). ALLOW_GENERIC_LOGIN=1
+# lets a general quay.io login stand in for a quay.io/rhoai one. The older names
+# RHOAI_QUAY_AUTH_FILE and RHOAI_QUAY_ALLOW_GENERIC_LOGIN still work.
+set -Eeuo pipefail
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+here="$(cd "$(dirname "$0")" && pwd)"
+dir="$(cd "$here/.." && pwd)"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --deployment) dir=$2; shift 2 ;;
+    *) die "usage: bootstrap-hub.sh [--deployment DIR]" ;;
+  esac
+done
+[ -d "$dir/root" ] || die "--deployment must be a checkout with root/"
+for c in oc jq git; do command -v "$c" >/dev/null || die "required command not found: $c"; done
+auth_file="${QUAY_AUTH_FILE:-${RHOAI_QUAY_AUTH_FILE:-}}"
+if [ -z "$auth_file" ]; then
+  for f in "$HOME/.config/containers/auth.json" "${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/containers/auth.json}"; do
+    [ -n "$f" ] && [ -f "$f" ] && { auth_file=$f; break; }
+  done
+fi
+[ -f "$auth_file" ] || die "no auth file: set QUAY_AUTH_FILE to a container auth file with a quay.io/rhoai login"
+allow_generic="${ALLOW_GENERIC_LOGIN:-${RHOAI_QUAY_ALLOW_GENERIC_LOGIN:-}}"
+
+. "$here/library.sh"
+library_dir "$dir" || exit 1
+lib=$LIB
+. "$here/clusters.sh"
+clusters_load "$dir" || exit 1
+hub=$(hub_name)
+cluster_login_ok "$hub" || exit 1
+KUBECONFIG=$(cluster_kubeconfig "$hub"); export KUBECONFIG
+echo "Hub: $hub ($(oc whoami --show-server))."
+bash "$here/check-deployment.sh" "$dir"
+. "$here/deployment-inputs.sh"
+deployment_render "$dir"
+echo "Library at $(deployment_input libraryRevision)."
+
+# Read the logins before any write, so a refused auth file leaves the hub as it
+# was. Prefer a login scoped to quay.io/rhoai (a robot token). A general quay.io
+# login is copied to the hub and to every site's pull secret, so using one needs
+# ALLOW_GENERIC_LOGIN=1.
+jq -e '.auths | type == "object"' "$auth_file" >/dev/null 2>&1 || die "can't read $auth_file as a container auth file"
+if ! RHOAI_QUAY_PULL_SECRET="$(jq -er '.auths["quay.io/rhoai"].auth' "$auth_file" 2>/dev/null)"; then
+  [ "$allow_generic" = 1 ] ||
+    die "no quay.io/rhoai login in $auth_file; add a robot token for quay.io/rhoai, or set ALLOW_GENERIC_LOGIN=1 to use the general quay.io login"
+  RHOAI_QUAY_PULL_SECRET="$(jq -er '.auths["quay.io"].auth' "$auth_file")" || die "no quay.io login in $auth_file"
+fi
+export RHOAI_QUAY_PULL_SECRET
+# The library mirrors registry.redhat.io/rhaii* (model runtimes) to
+# registry.stage.redhat.io and falls back to registry.redhat.io, so a stage
+# login is optional: pass it on when the auth file has one.
+if RHOAI_STAGE_PULL_SECRET="$(jq -er '.auths["registry.stage.redhat.io"].auth' "$auth_file" 2>/dev/null)"; then
+  export RHOAI_STAGE_PULL_SECRET
+else
+  unset RHOAI_STAGE_PULL_SECRET
+  echo "note: no registry.stage.redhat.io login in $auth_file; sites pull model runtimes from registry.redhat.io" >&2
+fi
+
+RHOAI_QUAY_PULL_SECRET_FILE="$auth_file" bash "$here/check-prerequisites.sh" --step hub --kubeconfig "$KUBECONFIG" ||
+  echo "Prerequisites incomplete before install; the ones this script installs are expected to be missing."
+
+oc apply -f "$lib/bootstrap/namespace.yaml" -f "$lib/bootstrap/gitops-operator-group.yaml" -f "$lib/bootstrap/openshift-gitops-sub.yaml"
+for crd in applications.argoproj.io applicationsets.argoproj.io; do
+  for _ in $(seq 1 120); do oc get crd "$crd" >/dev/null 2>&1 && break; sleep 5; done
+  oc wait --for=condition=Established "crd/$crd" --timeout=5m
+done
+for _ in $(seq 1 120); do
+  [ "$(oc -n openshift-gitops get argocd openshift-gitops -o jsonpath='{.status.phase}' 2>/dev/null)" = Available ] && break; sleep 5
+done
+oc apply -f "$lib/bootstrap/openshift-gitops-admin.yaml"
+# Give Argo CD's application controller the memory the library's gitops-config sets
+# (apps/gitops-config/manifests/argocd.yaml), before the root fans out. On a fresh hub
+# gitops-config can't apply it until ACM is installed, and with the operator's default
+# limit the controller runs out of memory first, so ACM never finishes. Same values,
+# so gitops-config's server-side apply takes them over without a conflict.
+patch=$(KUBECONFIG=/dev/null oc label --local -f "$lib/apps/gitops-config/manifests/argocd.yaml" ai-grid.dev/read=true -o json |
+  jq -c '{spec: {controller: {resources: .spec.controller.resources}}}')
+oc patch argocd openshift-gitops -n openshift-gitops --type merge -p "$patch"
+printf "%s\n" "$DEPLOYMENT_ROOT" | oc apply -f -
+
+bash "$lib/apps/rhoai-prerequisites/create-hub-secret.sh"
+echo "Bootstrapped. Check progress with: make status"
